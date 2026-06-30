@@ -572,6 +572,29 @@
   
   
     <li class="md-nav__item">
+      <a href="../../goal/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    Goal 扩展
+    
+  </span>
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../multiagent/" class="md-nav__link">
         
   
@@ -3968,8 +3991,16 @@
 </span></code></pre></div></td></tr></table></div>
 <p>完成以上配置后，摘要功能即可自动运行。</p>
 <h2 id="cache-safe-forking">Cache-Safe 摘要 Forking</h2>
-<p>默认情况下，摘要器会发送独立的摘要请求：可选的摘要 system prompt 加上一个
-包含已提取对话文本的 user prompt。这条路径简单直接，并且仍然是默认行为。</p>
+<p>摘要器有两种请求构造模式。</p>
+<p><strong>独立摘要请求</strong> 是默认模式。框架会先选出需要摘要的 events，把它们转换成
+conversation text；如果配置了 <code>WithPreSummaryHook(...)</code>，还会先执行这个
+hook。随后摘要模型收到的请求由下面两部分组成：</p>
+<ul>
+<li>可选的 system message，来自 <code>WithSystemPrompt(...)</code>。</li>
+<li>一条 user message，来自 <code>WithPrompt(...)</code>；其中 <code>{conversation_text}</code> 会被替换为提取出的对话文本。</li>
+</ul>
+<p>这条请求和主 agent 的请求相互独立，因此同步摘要、异步摘要、手动调用摘要接口
+都能使用。</p>
 <p>如果长会话场景对 prompt cache 命中率比较敏感，可以显式开启 cache-safe forking：</p>
 <div class="language-go highlight"><table class="highlighttable"><tr><td class="linenos"><div class="linenodiv"><pre><span></span><span class="normal"><a href="#__codelineno-4-1">1</a></span>
 <span class="normal"><a href="#__codelineno-4-2">2</a></span>
@@ -3983,14 +4014,44 @@
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5"></a><span class="w">    </span><span class="nx">summary</span><span class="p">.</span><span class="nx">WithCacheSafeForking</span><span class="p">(</span><span class="kc">true</span><span class="p">),</span>
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6"></a><span class="p">)</span>
 </span></code></pre></div></td></tr></table></div>
-<p>开启后，如果框架当前能拿到父会话的模型请求，摘要器会克隆这个父请求，并只在
-末尾追加一条用于压缩的 user message。这样可以保留父请求的 prefix，包括
-system context、历史消息和工具定义，让支持 prompt cache 的模型服务复用更多
+<p>在普通 LLM flow 里触发 context compaction 时，框架已经构造好了当前主 agent
+调用的父 <code>model.Request</code>。开启 <code>WithCacheSafeForking(true)</code> 后，摘要请求会按
+下面的方式构造：</p>
+<ul>
+<li>克隆这个父请求，保留它对模型可见的 prefix，包括 system context、已注入的
+  summary、session history、用户输入、工具定义、headers、extra fields 和
+  generation settings。</li>
+<li>在末尾追加一条 user message，内容来自 <code>WithCacheSafeForkPrompt(...)</code>。</li>
+<li>强制摘要调用使用非流式输出，并清掉 structured output，因为摘要调用只需要返回普通摘要文本。</li>
+</ul>
+<p>这样摘要请求和父请求拥有相同的前缀，支持 prompt cache 的模型服务就能复用更多
 已缓存输入。如果当前没有父请求，例如异步摘要或手动调用摘要接口，摘要器会自动
-回退到默认的独立摘要请求。</p>
-<p>追加的压缩提示词和 <code>WithPrompt(...)</code> 是分开的，因为它不再嵌入
-<code>{conversation_text}</code>；父请求本身已经包含对话前缀。只有需要自定义这条追加的
-user message 时，才需要使用 <code>WithCacheSafeForkPrompt(...)</code>。</p>
+回退到独立摘要请求。</p>
+<p>Prompt 规则：</p>
+<ul>
+<li><code>WithPrompt(...)</code> 配置独立摘要请求的 user prompt，必须包含
+  <code>{conversation_text}</code>。如果配置了 <code>WithMaxSummaryWords(...)</code>，
+  <code>{max_summary_words}</code> 必须出现在 <code>WithPrompt(...)</code> 或
+  <code>WithSystemPrompt(...)</code> 其中之一。</li>
+<li><code>WithSystemPrompt(...)</code> 配置独立摘要请求里可选的 system message，不能包含
+  <code>{conversation_text}</code>，可以包含 <code>{max_summary_words}</code>。</li>
+<li><code>WithCacheSafeForkPrompt(...)</code> 只配置 fork 模式下追加的 user message，不能
+  包含 <code>{conversation_text}</code>，因为克隆出来的父请求里已经有对话内容；它可以包含
+  <code>{max_summary_words}</code>。</li>
+</ul>
+<p>即使开启了 cache-safe forking，也要保持独立摘要 prompt 有效，因为 fallback
+路径仍然会使用它。自定义 fork prompt 时，建议明确要求模型“总结上面的对话，
+供后续继续对话使用”，并保留用户目标、决策、约束、未完成事项、工具结果和重要
+事实；同时要求模型不要调用工具、不要直接回答最新用户请求，也不要把 system
+和 tool-use 指令当作事实写进摘要。</p>
+<p><code>WithPreSummaryHook(...)</code> 仍然会在摘要模型调用前执行。独立摘要模式下，hook
+修改后的文本会渲染进 <code>{conversation_text}</code>；如果 fork 模式拿到了父请求，则
+这段文本不会再被塞进摘要请求，因为对话内容已经在克隆的父请求里。此时 hook
+仍可用于更新 context、做副作用处理，以及服务 fallback 到独立摘要请求的场景。</p>
+<p>在 fork 模式下，<code>WithPreSummaryHook(...)</code> 对 text 或 events 的修改不会对克隆
+出来的父请求做脱敏、redaction 或 filtering。如果这个 hook 用于在摘要前做脱敏
+或过滤，请让这类流程使用独立摘要模式，或确保父 <code>model.Request</code> 在被克隆前已经
+完成脱敏。</p>
 <p>Cache-safe forking 控制的是“生成摘要那次请求”的构造方式。摘要已经生成以后，
 下一次普通对话请求如果也希望更利于 prompt cache，建议把摘要注入为 user
 message，而不是合并进 system prompt：</p>
@@ -5916,7 +5977,7 @@ request，用来检查历史大 <code>tool result</code> 是否按预期被替�
     <span class="md-icon" title="最后更新">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M21 13.1c-.1 0-.3.1-.4.2l-1 1 2.1 2.1 1-1c.2-.2.2-.6 0-.8l-1.3-1.3c-.1-.1-.2-.2-.4-.2m-1.9 1.8-6.1 6V23h2.1l6.1-6.1zM12.5 7v5.2l4 2.4-1 1L11 13V7zM11 21.9c-5.1-.5-9-4.8-9-9.9C2 6.5 6.5 2 12 2c5.3 0 9.6 4.1 10 9.3-.3-.1-.6-.2-1-.2s-.7.1-1 .2C19.6 7.2 16.2 4 12 4c-4.4 0-8 3.6-8 8 0 4.1 3.1 7.5 7.1 7.9l-.1.2z"/></svg>
     </span>
-    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="2026年6月28日 09:02:54 UTC">2026-06-28 09:02:54</span>
+    <span class="git-revision-date-localized-plugin git-revision-date-localized-plugin-iso_datetime" title="2026年6月30日 03:46:09 UTC">2026-06-30 03:46:09</span>
   </span>
 
     
